@@ -15,25 +15,86 @@ private:
         Node(ValueType&& val, Node* p = nullptr, Node* n = nullptr) : data(std::move(val)), prev(p), next(n) {}
     };
 
+    struct MemoryPool {
+        struct Chunk {
+            static const int CHUNK_SIZE = 8192;
+            typename std::aligned_storage<sizeof(Node), alignof(Node)>::type data[CHUNK_SIZE];
+            Chunk* next;
+            int used;
+            Chunk() : next(nullptr), used(0) {}
+        };
+        Chunk* chunkHead;
+        Node* freeList;
+        
+        MemoryPool() : chunkHead(new Chunk()), freeList(nullptr) {}
+        ~MemoryPool() {
+            while (chunkHead) {
+                Chunk* temp = chunkHead;
+                chunkHead = chunkHead->next;
+                delete temp;
+            }
+        }
+        
+        Node* allocate(const ValueType& val, Node* p, Node* n) {
+            Node* res;
+            if (freeList) {
+                res = freeList;
+                freeList = freeList->next;
+            } else {
+                if (chunkHead->used == Chunk::CHUNK_SIZE) {
+                    Chunk* newChunk = new Chunk();
+                    newChunk->next = chunkHead;
+                    chunkHead = newChunk;
+                }
+                res = reinterpret_cast<Node*>(&chunkHead->data[chunkHead->used++]);
+            }
+            new (res) Node(val, p, n);
+            return res;
+        }
+        
+        void deallocate(Node* p) {
+            p->~Node();
+            p->next = freeList;
+            freeList = p;
+        }
+    };
+
+    static MemoryPool pool;
+
     Node* head;
     Node* tail;
     int sz;
+    
+    mutable Node* cacheNode;
+    mutable int cacheIndex;
 
 public:
-    MyList() : head(nullptr), tail(nullptr), sz(0) {}
+    MyList() : head(nullptr), tail(nullptr), sz(0), cacheNode(nullptr), cacheIndex(-1) {}
 
-    MyList(MyList &&obj) noexcept : head(obj.head), tail(obj.tail), sz(obj.sz) {
+    MyList(MyList &&obj) noexcept : head(obj.head), tail(obj.tail), sz(obj.sz), cacheNode(obj.cacheNode), cacheIndex(obj.cacheIndex) {
         obj.head = nullptr;
         obj.tail = nullptr;
         obj.sz = 0;
+        obj.cacheNode = nullptr;
+        obj.cacheIndex = -1;
     }
 
-    MyList(const MyList &obj) : head(nullptr), tail(nullptr), sz(0) {
+    MyList(const MyList &obj) : head(nullptr), tail(nullptr), sz(0), cacheNode(nullptr), cacheIndex(-1) {
+        if (obj.empty()) return;
         Node* curr = obj.head;
+        Node* myTail = nullptr;
         while (curr) {
-            push_back(curr->data);
+            Node* newNode = pool.allocate(curr->data, myTail, nullptr);
+            if (myTail) {
+                myTail->next = newNode;
+            } else {
+                head = newNode;
+            }
+            myTail = newNode;
             curr = curr->next;
         }
+        tail = myTail;
+        sz = obj.sz;
     }
 
     ~MyList() {
@@ -43,11 +104,21 @@ public:
     MyList& operator=(const MyList& obj) {
         if (this != &obj) {
             clear();
+            if (obj.empty()) return *this;
             Node* curr = obj.head;
+            Node* myTail = nullptr;
             while (curr) {
-                push_back(curr->data);
+                Node* newNode = pool.allocate(curr->data, myTail, nullptr);
+                if (myTail) {
+                    myTail->next = newNode;
+                } else {
+                    head = newNode;
+                }
+                myTail = newNode;
                 curr = curr->next;
             }
+            tail = myTail;
+            sz = obj.sz;
         }
         return *this;
     }
@@ -58,15 +129,52 @@ public:
             head = obj.head;
             tail = obj.tail;
             sz = obj.sz;
+            cacheNode = obj.cacheNode;
+            cacheIndex = obj.cacheIndex;
             obj.head = nullptr;
             obj.tail = nullptr;
             obj.sz = 0;
+            obj.cacheNode = nullptr;
+            obj.cacheIndex = -1;
         }
         return *this;
     }
 
+    void invalidateCache() const {
+        cacheNode = nullptr;
+        cacheIndex = -1;
+    }
+
+    Node* getNode(int index) const {
+        if (index == cacheIndex && cacheNode) return cacheNode;
+        
+        Node* curr = nullptr;
+        int distFromHead = index;
+        int distFromTail = sz - 1 - index;
+        int distFromCache = cacheNode ? std::abs(index - cacheIndex) : sz + 1;
+        
+        if (distFromCache <= distFromHead && distFromCache <= distFromTail) {
+            curr = cacheNode;
+            if (index > cacheIndex) {
+                for (int i = cacheIndex; i < index; ++i) curr = curr->next;
+            } else {
+                for (int i = cacheIndex; i > index; --i) curr = curr->prev;
+            }
+        } else if (distFromHead <= distFromTail) {
+            curr = head;
+            for (int i = 0; i < index; ++i) curr = curr->next;
+        } else {
+            curr = tail;
+            for (int i = sz - 1; i > index; --i) curr = curr->prev;
+        }
+        
+        cacheNode = curr;
+        cacheIndex = index;
+        return curr;
+    }
+
     void push_back(const ValueType &value) {
-        Node* newNode = new Node(value, tail, nullptr);
+        Node* newNode = pool.allocate(value, tail, nullptr);
         if (tail) {
             tail->next = newNode;
         } else {
@@ -74,6 +182,7 @@ public:
         }
         tail = newNode;
         sz++;
+        invalidateCache();
     }
 
     void pop_back() {
@@ -85,12 +194,13 @@ public:
         } else {
             head = nullptr;
         }
-        delete temp;
+        pool.deallocate(temp);
         sz--;
+        invalidateCache();
     }
 
     void push_front(const ValueType &value) {
-        Node* newNode = new Node(value, nullptr, head);
+        Node* newNode = pool.allocate(value, nullptr, head);
         if (head) {
             head->prev = newNode;
         } else {
@@ -98,6 +208,7 @@ public:
         }
         head = newNode;
         sz++;
+        invalidateCache();
     }
 
     void pop_front() {
@@ -109,8 +220,9 @@ public:
         } else {
             tail = nullptr;
         }
-        delete temp;
+        pool.deallocate(temp);
         sz--;
+        invalidateCache();
     }
 
     ValueType &front() const {
@@ -130,14 +242,12 @@ public:
         } else if (index == sz) {
             push_back(value);
         } else {
-            Node* curr = head;
-            for (int i = 0; i < index; ++i) {
-                curr = curr->next;
-            }
-            Node* newNode = new Node(value, curr->prev, curr);
+            Node* curr = getNode(index);
+            Node* newNode = pool.allocate(value, curr->prev, curr);
             curr->prev->next = newNode;
             curr->prev = newNode;
             sz++;
+            invalidateCache();
         }
     }
 
@@ -148,14 +258,12 @@ public:
         } else if (index == sz - 1) {
             pop_back();
         } else {
-            Node* curr = head;
-            for (int i = 0; i < index; ++i) {
-                curr = curr->next;
-            }
+            Node* curr = getNode(index);
             curr->prev->next = curr->next;
             curr->next->prev = curr->prev;
-            delete curr;
+            pool.deallocate(curr);
             sz--;
+            invalidateCache();
         }
     }
 
@@ -171,18 +279,31 @@ public:
         while (head) {
             Node* temp = head;
             head = head->next;
-            delete temp;
+            pool.deallocate(temp);
         }
         tail = nullptr;
         sz = 0;
+        invalidateCache();
     }
 
     void link(const MyList &obj) {
+        if (obj.empty()) return;
         Node* curr = obj.head;
-        while (curr) {
-            push_back(curr->data);
+        int n = obj.sz;
+        Node* myTail = tail;
+        for (int i = 0; i < n; ++i) {
+            Node* newNode = pool.allocate(curr->data, myTail, nullptr);
+            if (myTail) {
+                myTail->next = newNode;
+            } else {
+                head = newNode;
+            }
+            myTail = newNode;
             curr = curr->next;
         }
+        tail = myTail;
+        sz += n;
+        invalidateCache();
     }
 
     MyList cut(int index) {
@@ -198,13 +319,11 @@ public:
             head = nullptr;
             tail = nullptr;
             sz = 0;
+            invalidateCache();
             return result;
         }
         
-        Node* curr = head;
-        for (int i = 0; i < index; ++i) {
-            curr = curr->next;
-        }
+        Node* curr = getNode(index);
         
         result.head = curr;
         result.tail = tail;
@@ -215,9 +334,13 @@ public:
         curr->prev = nullptr;
         
         sz = index;
+        invalidateCache();
         
         return result;
     }
 };
+
+template<typename ValueType>
+typename MyList<ValueType>::MemoryPool MyList<ValueType>::pool;
 
 #endif
